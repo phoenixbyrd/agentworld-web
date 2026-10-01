@@ -585,10 +585,10 @@ async function saveLogin() {
     var nh = nsecToHex(nsecInput);
     if (!nh) { $('loginmsg').textContent = 'that nsec doesn\u2019t decode \u2014 nothing saved'; return; }
     try { localStorage.setItem('aw_nsec', nsecInput); } catch (e) {}
-    humanNpubStr = hexToNpub(nh);   // your npub, derived — a typed npub can't disagree
+    await initIdentity();           // this device now signs AS your npub
+    humanNpubStr = hexToNpub(myPubHex);   // derived from the PUBLIC key — never the nsec bytes
     $('humannpub').value = humanNpubStr;
     $('nsecin').value = '';
-    await initIdentity();           // this device now signs AS your npub
     msg = 'proven identity \u2014 you sign as ' + shortId(myPubHex) + '. ';
   }
   humanNpubStr = $('humannpub').value.trim();
