@@ -1467,4 +1467,20 @@ async function init() {
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
 else init();
 
+/* Headless QA hook — only exposed with ?awtest=1 in the URL. Lets automated
+ * smoke tests drive the game lobby (read sessions, inject remote events)
+ * without touching network or identity code paths. */
+try {
+  if (new URLSearchParams(location.search).get('awtest') === '1') {
+    window.AWTEST = {
+      games: function () { return games; },
+      gstates: function () { return gstates; },
+      myPub: function () { return myPubHex; },
+      onGameSession: onGameSession,
+      onGameState: onGameState,
+      renderGameList: renderGameList
+    };
+  }
+} catch (e) {}
+
 })();
