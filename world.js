@@ -252,7 +252,8 @@ function setSubs() {
     { id: 'aw:room:' + r + ':' + q, purpose: 'room', room: r, filter: { kinds: [30030], '#d': [r] } },
     { id: 'aw:obj:' + r + ':' + q,  purpose: 'obj',  room: r, filter: { kinds: [30031] } },
     { id: 'aw:pres:' + r + ':' + q, purpose: 'pres', room: r, filter: { kinds: [30010], '#d': [r] } },
-    { id: 'aw:chat:' + r + ':' + q, purpose: 'chat', room: r, filter: { kinds: [20111], '#room': [r], limit: 60 } }
+    { id: 'aw:chat:' + r + ':' + q, purpose: 'chat', room: r, filter: { kinds: [20111], '#room': [r], limit: 60 } },
+    { id: 'aw:game:' + r + ':' + q, purpose: 'game', room: r, filter: { kinds: [30032, 30033, 30034], '#room': [r] } }
   ];
   activeSubs.forEach(function (s) { broadcast(JSON.stringify(['REQ', s.id, s.filter])); });
 }
@@ -268,6 +269,7 @@ function handleMsg(data) {
   else if (sub.purpose === 'obj') onObjEvent(ev);
   else if (sub.purpose === 'pres') onPresence(ev);
   else if (sub.purpose === 'chat') onChat(ev);
+  else if (sub.purpose === 'game') onGameEvent(ev);
   else if (sub.purpose === 'prof') onProfile(ev);
 }
 
@@ -464,6 +466,7 @@ function setRoom(id) {
   $('roomname').textContent = 'room: ' + id;
   setSubs();
   clearChat();
+  clearGames();
   applySpawn = true;  // fresh room entry: start at the viewpoint
   buildScene(fallbackVRML(id));
   sysLine('entering ' + id + '…');
@@ -740,6 +743,509 @@ function bindHist() {
   }
 }
 
+/* ---------------- games: lobby + tic-tac-toe + connect 4 + trivia ------ */
+/* Protocol (AgentWorld v0.7):
+ *   kind 30032  game session, parameterized replaceable, #d = gameId, #room
+ *               {v,id,game,status,host,hostName,players[],names{},room,winner,at}
+ *               status: open -> playing -> finished
+ *   kind 30033  game state, #d = gameId, #room
+ *               tictactoe/connect4: {v,id,game,seq,board[],turn,winner,at}
+ *               trivia: {v,id,game:'trivia',seq,round,phase,q,answers{},scores{},at}
+ *   kind 30034  trivia answer, parameterized replaceable, #d = gameId:playerHex
+ *               {v,choice} — one slot per player, no write clobbering
+ * Humans and agents share the same events; either side can host or join.
+ */
+var GK = { SESSION: 30032, STATE: 30033, ANSWER: 30034 };
+var GDEF = {
+  tictactoe: { label: 'Tic-tac-toe', maxp: 2 },
+  connect4:  { label: 'Connect 4', maxp: 2 },
+  trivia:    { label: 'Trivia', maxp: 8 }
+};
+var games = {};        // gameId -> session
+var gstates = {};      // gameId -> latest state
+var ganswers = {};     // gameId -> {playerHex: choiceIdx}
+var openGameId = null; // board currently displayed
+var triviaTimers = {}; // gameId -> timeout id (host only)
+var TRIVIA_ROUNDS = 5, TRIVIA_QSECS = 25, TRIVIA_RSECS = 6;
+
+/* ---- pure game logic (unit-tested in node) ---- */
+function tttWinner(b) {
+  var L = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+  for (var i = 0; i < L.length; i++) {
+    var a = L[i][0], c = L[i][1], d = L[i][2];
+    if (b[a] && b[a] === b[c] && b[a] === b[d]) return b[a];
+  }
+  for (var j = 0; j < 9; j++) if (!b[j]) return null;
+  return 'draw';
+}
+function c4Drop(b, col, piece) {
+  for (var r = 5; r >= 0; r--) {
+    var i = r * 7 + col;
+    if (!b[i]) { b[i] = piece; return r; }
+  }
+  return -1;
+}
+function c4Winner(b) {
+  function at(r, c) { return (r < 0 || r > 5 || c < 0 || c > 6) ? null : b[r * 7 + c]; }
+  for (var r = 0; r < 6; r++) for (var c = 0; c < 7; c++) {
+    var p = at(r, c);
+    if (!p) continue;
+    if (at(r, c+1) === p && at(r, c+2) === p && at(r, c+3) === p) return p;
+    if (at(r+1, c) === p && at(r+2, c) === p && at(r+3, c) === p) return p;
+    if (at(r+1, c+1) === p && at(r+2, c+2) === p && at(r+3, c+3) === p) return p;
+    if (at(r+1, c-1) === p && at(r+2, c-2) === p && at(r+3, c-3) === p) return p;
+  }
+  for (var k = 0; k < 42; k++) if (!b[k]) return null;
+  return 'draw';
+}
+
+/* ---- trivia question bank (shared with the Mica bot) ---- */
+var TRIVIA_BANK = [
+  { q: 'Which planet is known as the Red Planet?', c: ['Venus', 'Mars', 'Jupiter', 'Mercury'], a: 1 },
+  { q: 'How many legs does a spider have?', c: ['6', '8', '10', '4'], a: 1 },
+  { q: 'What is the largest ocean on Earth?', c: ['Atlantic', 'Indian', 'Pacific', 'Arctic'], a: 2 },
+  { q: 'What gas do plants absorb from the air?', c: ['Oxygen', 'Carbon dioxide', 'Nitrogen', 'Hydrogen'], a: 1 },
+  { q: 'How many days are in a leap year?', c: ['365', '366', '367', '364'], a: 1 },
+  { q: 'What is the capital of Japan?', c: ['Kyoto', 'Osaka', 'Tokyo', 'Beijing'], a: 2 },
+  { q: 'H2O is the chemical formula for…', c: ['Salt', 'Sugar', 'Water', 'Oxygen'], a: 2 },
+  { q: 'Which planet is famous for its rings?', c: ['Mars', 'Saturn', 'Venus', 'Neptune'], a: 1 },
+  { q: 'How many colors are in a rainbow?', c: ['5', '6', '7', '8'], a: 2 },
+  { q: 'What is the fastest land animal?', c: ['Lion', 'Greyhound', 'Cheetah', 'Horse'], a: 2 },
+  { q: 'What do honeybees make?', c: ['Wax paper', 'Honey', 'Silk', 'Syrup'], a: 1 },
+  { q: 'How many strings does a standard guitar have?', c: ['4', '5', '6', '7'], a: 2 },
+  { q: 'What is the largest mammal on Earth?', c: ['Elephant', 'Blue whale', 'Giraffe', 'Hippo'], a: 1 },
+  { q: 'Water boils at what temperature (°C)?', c: ['90', '95', '100', '110'], a: 2 },
+  { q: 'Which of these is a prime number?', c: ['4', '6', '7', '9'], a: 2 },
+  { q: 'What is the capital of France?', c: ['London', 'Paris', 'Rome', 'Madrid'], a: 1 },
+  { q: 'How many sides does a hexagon have?', c: ['5', '6', '7', '8'], a: 1 },
+  { q: 'Which planet is closest to the Sun?', c: ['Venus', 'Earth', 'Mercury', 'Mars'], a: 2 },
+  { q: 'Which instrument has 88 keys?', c: ['Guitar', 'Piano', 'Violin', 'Drums'], a: 1 },
+  { q: 'How many minutes are in an hour?', c: ['30', '60', '90', '100'], a: 1 },
+  { q: 'What does a thermometer measure?', c: ['Weight', 'Temperature', 'Speed', 'Pressure'], a: 1 },
+  { q: 'Which animal is a marsupial?', c: ['Kangaroo', 'Zebra', 'Panda', 'Koala'], a: 0 },
+  { q: 'How many players does a soccer team field?', c: ['9', '10', '11', '12'], a: 2 },
+  { q: 'What is frozen water called?', c: ['Steam', 'Ice', 'Mist', 'Dew'], a: 1 }
+];
+
+/* ---- protocol helpers ---- */
+function nowSec() { return Math.floor(Date.now() / 1000); }
+function newGameId() {
+  var h = '0123456789abcdef', s = 'g';
+  for (var i = 0; i < 8; i++) s += h[Math.floor(Math.random() * 16)];
+  return s;
+}
+function dTag(ev) {
+  var t = ev.tags || [];
+  for (var i = 0; i < t.length; i++) if (t[i][0] === 'd') return t[i][1];
+  return null;
+}
+async function pubGameSession(s) {
+  s.at = nowSec();
+  publish(await makeEvent(GK.SESSION, [['d', s.id], ['room', roomId]], JSON.stringify(s)));
+}
+async function pubGameState(st) {
+  st.at = nowSec();
+  publish(await makeEvent(GK.STATE, [['d', st.id], ['room', roomId]], JSON.stringify(st)));
+}
+async function pubAnswer(id, choice) {
+  publish(await makeEvent(GK.ANSWER, [['d', id + ':' + myPubHex], ['room', roomId]],
+    JSON.stringify({ v: 1, choice: choice })));
+}
+function gameName(s) {
+  var n = (s.names && s.names[s.host]) || s.hostName || 'host';
+  return GDEF[s.game].label + ' — ' + String(n).slice(0, 18);
+}
+function shortHex(h) { return '@' + String(h || '').slice(0, 8); }
+
+/* ---- actions ---- */
+async function startGame(game) {
+  var id = newGameId();
+  var s = { v: 1, id: id, game: game, status: 'open', host: myPubHex, hostName: myName,
+            players: [myPubHex], names: {}, room: roomId, winner: null, at: nowSec() };
+  s.names[myPubHex] = myName;
+  games[id] = s;
+  await pubGameSession(s);
+  var st;
+  if (game === 'tictactoe') {
+    st = { v: 1, id: id, game: game, seq: 0, board: ['', '', '', '', '', '', '', '', ''],
+           turn: myPubHex, winner: null, at: nowSec() };
+  } else if (game === 'connect4') {
+    var b = []; for (var i = 0; i < 42; i++) b.push('');
+    st = { v: 1, id: id, game: game, seq: 0, board: b, turn: myPubHex, winner: null, at: nowSec() };
+  } else {
+    st = { v: 1, id: id, game: 'trivia', seq: 0, round: 0, phase: 'lobby',
+           q: null, answers: {}, scores: {}, at: nowSec() };
+  }
+  gstates[id] = st;
+  await pubGameState(st);
+  renderGameList();
+  openBoard(id);
+  sysLine('you started ' + GDEF[game].label + ' — others join from 🎮');
+  publish(await makeEvent(20111, [['room', roomId]],
+    JSON.stringify({ name: myName, text: '🎮 started ' + GDEF[game].label + ' — open 🎮 to join!' })));
+}
+async function joinGame(id) {
+  var s = games[id];
+  if (!s || s.status !== 'open') return;
+  if (s.players.indexOf(myPubHex) >= 0) { openBoard(id); return; }
+  if (s.players.length >= GDEF[s.game].maxp) return;
+  s.players.push(myPubHex);
+  s.names[myPubHex] = myName;
+  if (s.game !== 'trivia' && s.players.length >= 2) s.status = 'playing';
+  games[id] = s;
+  await pubGameSession(s);
+  renderGameList();
+  openBoard(id);
+  sysLine('you joined ' + gameName(s));
+}
+async function finishGame(s, winner) {
+  s.status = 'finished'; s.winner = winner || null;
+  await pubGameSession(s);
+  renderGameList(); renderBoard();
+}
+function otherPlayer(s) {
+  for (var i = 0; i < s.players.length; i++)
+    if (s.players[i] !== myPubHex) return s.players[i];
+  return null;
+}
+async function tttMove(i) {
+  var s = games[openGameId], st = gstates[openGameId];
+  if (!s || !st || s.status !== 'playing' || st.winner) return;
+  if (st.turn !== myPubHex || st.board[i]) return;
+  var piece = (s.players[0] === myPubHex) ? 'X' : 'O';
+  st.board[i] = piece;
+  var w = tttWinner(st.board);
+  st.winner = (w === 'draw') ? 'draw' : (w ? myPubHex : null);
+  st.turn = otherPlayer(s);
+  st.seq++;
+  await pubGameState(st);
+  renderBoard();
+  if (st.winner) finishGame(s, st.winner);
+}
+async function c4Move(col) {
+  var s = games[openGameId], st = gstates[openGameId];
+  if (!s || !st || s.status !== 'playing' || st.winner) return;
+  if (st.turn !== myPubHex) return;
+  var piece = (s.players[0] === myPubHex) ? 'R' : 'Y';
+  var board = st.board.slice();
+  if (c4Drop(board, col, piece) < 0) return;   // column full
+  st.board = board;
+  var w = c4Winner(st.board);
+  st.winner = (w === 'draw') ? 'draw' : (w ? myPubHex : null);
+  st.turn = otherPlayer(s);
+  st.seq++;
+  await pubGameState(st);
+  renderBoard();
+  if (st.winner) finishGame(s, st.winner);
+}
+/* trivia: host drives rounds, everyone answers into their own 30034 slot */
+async function triviaStart(id) {
+  var s = games[id];
+  if (!s || s.host !== myPubHex || s.status !== 'open') return;
+  if (s.players.length < 2) { sysLine('trivia needs at least 2 players'); return; }
+  s.status = 'playing';
+  await pubGameSession(s);
+  triviaAsk(id);
+}
+async function triviaAsk(id) {
+  var s = games[id];
+  if (!s || s.host !== myPubHex || s.status !== 'playing') return;
+  var st = gstates[id] || { v: 1, id: id, game: 'trivia', seq: 0, scores: {} };
+  var round = (st.round || 0) + 1;
+  var q = TRIVIA_BANK[Math.floor(Math.random() * TRIVIA_BANK.length)];
+  st.round = round; st.phase = 'question';
+  st.q = { q: q.q, c: q.c, a: q.a };
+  st.answers = {}; st.seq++;
+  gstates[id] = st; ganswers[id] = {};
+  await pubGameState(st);
+  renderBoard();
+  if (triviaTimers[id]) clearTimeout(triviaTimers[id]);
+  triviaTimers[id] = setTimeout(function () { triviaReveal(id); }, TRIVIA_QSECS * 1000);
+}
+async function triviaReveal(id) {
+  var s = games[id], st = gstates[id];
+  if (!s || !st || s.host !== myPubHex || st.phase !== 'question') return;
+  var ans = ganswers[id] || {};
+  var scores = st.scores || {};
+  for (var hx in ans) {
+    if (ans[hx] === st.q.a) scores[hx] = (scores[hx] || 0) + 1;
+    else if (!(hx in scores)) scores[hx] = 0;
+  }
+  for (var i = 0; i < s.players.length; i++)
+    if (!(s.players[i] in scores)) scores[s.players[i]] = 0;
+  st.answers = ans; st.scores = scores; st.phase = 'reveal'; st.seq++;
+  await pubGameState(st);
+  renderBoard();
+  if (triviaTimers[id]) clearTimeout(triviaTimers[id]);
+  triviaTimers[id] = setTimeout(function () {
+    var cur = gstates[id];
+    if (!cur || games[id].host !== myPubHex) return;
+    if (cur.round >= TRIVIA_ROUNDS) {
+      var best = null, bestN = -1, tie = false;
+      for (var hx in cur.scores) {
+        if (cur.scores[hx] > bestN) { best = hx; bestN = cur.scores[hx]; tie = false; }
+        else if (cur.scores[hx] === bestN) tie = true;
+      }
+      finishGame(games[id], tie ? 'draw' : best);
+    } else triviaAsk(id);
+  }, TRIVIA_RSECS * 1000);
+}
+async function triviaAnswer(i) {
+  var st = gstates[openGameId];
+  if (!st || st.game !== 'trivia' || st.phase !== 'question') return;
+  var cur = (ganswers[openGameId] || {})[myPubHex];
+  if (cur === i) return;
+  if (!ganswers[openGameId]) ganswers[openGameId] = {};
+  ganswers[openGameId][myPubHex] = i;
+  await pubAnswer(openGameId, i);
+  renderBoard();
+}
+
+/* ---- event handlers ---- */
+function onGameEvent(ev) {
+  if (ev.kind === GK.SESSION) onGameSession(ev);
+  else if (ev.kind === GK.STATE) onGameState(ev);
+  else if (ev.kind === GK.ANSWER) onGameAnswer(ev);
+}
+function onGameSession(ev) {
+  if (dTag(ev) === null) return;
+  var s = null;
+  try { s = JSON.parse(ev.content); } catch (e) { return; }
+  if (!s || s.id !== dTag(ev) || !GDEF[s.game] || !Array.isArray(s.players)) return;
+  if (!s.players.every(function (p) { return typeof p === 'string' && /^[0-9a-f]{64}$/.test(p); })) return;
+  var old = games[s.id];
+  if (old && (s.at || 0) < (old.at || 0)) return;   // older session update: ignore
+  if (old && old.host !== s.host) return;          // host never changes
+  games[s.id] = s;
+  if (s.status === 'open' && s.players.indexOf(myPubHex) < 0 &&
+      s.players.length < GDEF[s.game].maxp) {
+    sysLine(gameName(s) + ' is open — tap 🎮 to join');
+  }
+  renderGameList();
+  if (openGameId === s.id) renderBoard();
+}
+function onGameState(ev) {
+  var st = null;
+  try { st = JSON.parse(ev.content); } catch (e) { return; }
+  if (!st || st.id !== dTag(ev) || !GDEF[st.game]) return;
+  if (!Array.isArray(st.board) || st.board.length !== (st.game === 'connect4' ? 42 : 9)) {
+    if (st.game !== 'trivia') return;
+  }
+  var old = gstates[st.id];
+  if (old && (st.seq || 0) <= (old.seq || 0)) return;   // stale move: ignore
+  gstates[st.id] = st;
+  if (openGameId === st.id) renderBoard();
+}
+function onGameAnswer(ev) {
+  var d = dTag(ev);
+  if (!d) return;
+  var parts = d.split(':');
+  if (parts.length !== 2) return;
+  var id = parts[0], hx = parts[1];
+  if (hx !== ev.pubkey) return;   // answer slot belongs to its author
+  var a = null;
+  try { a = JSON.parse(ev.content); } catch (e) { return; }
+  if (!a || typeof a.choice !== 'number' || a.choice < 0 || a.choice > 3) return;
+  if (!ganswers[id]) ganswers[id] = {};
+  ganswers[id][hx] = a.choice;
+  if (openGameId === id) renderBoard();
+}
+
+/* ---- lobby + board UI ---- */
+function openGames() {
+  closeBoard();
+  $('boardpanel').classList.remove('open');
+  $('gamespanel').classList.add('open');
+  renderGameList();
+}
+function closeGames() { $('gamespanel').classList.remove('open'); }
+function renderGameList() {
+  var list = $('gamelist');
+  var ids = Object.keys(games).filter(function (id) { return games[id].status !== 'finished'; });
+  ids.sort(function (a, b) { return (games[b].at || 0) - (games[a].at || 0); });
+  var done = Object.keys(games).filter(function (id) { return games[id].status === 'finished'; });
+  done.sort(function (a, b) { return (games[b].at || 0) - (games[a].at || 0); });
+  done = done.slice(0, 3);
+  var html = '';
+  function row(s) {
+    var me = s.players.indexOf(myPubHex) >= 0;
+    var btn;
+    if (s.status === 'open' && !me && s.players.length < GDEF[s.game].maxp)
+      btn = '<button data-join="' + s.id + '">Join</button>';
+    else if (me || s.status !== 'open')
+      btn = '<button data-open="' + s.id + '">Open</button>';
+    else btn = '<span class="gs">full</span>';
+    var pl = s.players.map(function (p) { return (s.names && s.names[p]) || shortHex(p); }).join(', ');
+    var res = '';
+    if (s.status === 'finished') {
+      res = ' · ' + (s.winner === 'draw' ? 'draw' :
+        'winner: ' + (((s.names && s.names[s.winner]) || shortHex(s.winner)) || '?'));
+    }
+    return '<div class="gamerow"><div class="gt">' + escHtml(GDEF[s.game].label) + '</div>' +
+      '<div class="gs">' + escHtml(gameName(s)) + ' · ' + s.status + ' · ' +
+      s.players.length + '/' + GDEF[s.game].maxp + res + '<br>' + escHtml(pl) + '</div>' + btn + '</div>';
+  }
+  ids.forEach(function (id) { html += row(games[id]); });
+  done.forEach(function (id) { html += row(games[id]); });
+  if (!html) html = '<div class="gs">No games yet — start one below.</div>';
+  list.innerHTML = html;
+  var btns = list.querySelectorAll('button[data-join]');
+  for (var i = 0; i < btns.length; i++)
+    btns[i].addEventListener('click', function () { joinGame(this.getAttribute('data-join')); });
+  var ops = list.querySelectorAll('button[data-open]');
+  for (var j = 0; j < ops.length; j++)
+    ops[j].addEventListener('click', function () { openBoard(this.getAttribute('data-open')); });
+  var anyOpen = ids.some(function (id) {
+    var s = games[id];
+    return s.status === 'open' && s.players.indexOf(myPubHex) < 0;
+  });
+  var dot = $('gamebtn').querySelector('.dot');
+  if (dot) dot.style.display = anyOpen && !$('gamespanel').classList.contains('open') ? '' : 'none';
+}
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+function openBoard(id) {
+  if (!games[id]) return;
+  openGameId = id;
+  closeGames();
+  $('boardpanel').classList.add('open');
+  renderBoard();
+}
+function closeBoard() {
+  openGameId = null;
+  $('boardpanel').classList.remove('open');
+}
+function pname(s, hx) {
+  return escHtml((s.names && s.names[hx]) || shortHex(hx));
+}
+function renderBoard() {
+  var body = $('boardbody'), status = $('boardstatus'), title = $('boardtitle');
+  var s = games[openGameId], st = gstates[openGameId];
+  if (!s) { closeBoard(); return; }
+  title.textContent = '🎮 ' + GDEF[s.game].label;
+  var html = '', stat = '';
+  if (s.game === 'tictactoe') {
+    var r = renderTTT(s, st); stat = r.stat; html = r.html;
+  } else if (s.game === 'connect4') {
+    var r2 = renderC4(s, st); stat = r2.stat; html = r2.html;
+  } else {
+    var r3 = renderTrivia(s, st); stat = r3.stat; html = r3.html;
+  }
+  status.innerHTML = stat;
+  body.innerHTML = html;
+  bindBoardButtons(s, st);
+}
+function turnText(s, st) {
+  if (!st || st.winner) {
+    if (!st || !st.winner) return 'waiting for players…';
+    if (st.winner === 'draw') return "it's a draw!";
+    return (st.winner === myPubHex ? 'you win! 🎉' : pname(s, st.winner) + ' wins!');
+  }
+  if (s.status !== 'playing') return 'waiting for players…';
+  return st.turn === myPubHex ? 'your move' : pname(s, st.turn) + "'s move";
+}
+function renderTTT(s, st) {
+  var html = '<div id="tttgrid">';
+  var b = (st && st.board) || ['', '', '', '', '', '', '', '', ''];
+  for (var i = 0; i < 9; i++)
+    html += '<button class="cell" data-ttt="' + i + '">' + (b[i] || '') + '</button>';
+  html += '</div>';
+  return { stat: escHtml(turnText(s, st)), html: html };
+}
+function renderC4(s, st) {
+  var b = (st && st.board) || [];
+  while (b.length < 42) b.push('');
+  var html = '<div id="c4grid">';
+  for (var c = 0; c < 7; c++)
+    html += '<button class="cell top" data-c4="' + c + '">▼</button>';
+  for (var r = 0; r < 6; r++) for (var cc = 0; cc < 7; cc++) {
+    var v = b[r * 7 + cc];
+    html += '<button class="cell" data-c4="' + cc + '">' + (v === 'R' ? '🔴' : v === 'Y' ? '🟡' : '') + '</button>';
+  }
+  html += '</div>';
+  return { stat: escHtml(turnText(s, st)), html: html };
+}
+function renderTrivia(s, st) {
+  var html = '', stat = '';
+  var me = myPubHex;
+  if (s.status === 'open') {
+    stat = escHtml(s.players.length + ' player' + (s.players.length > 1 ? 's' : '') + ' — waiting');
+    html = '<div class="gs">' + s.players.map(function (p) { return pname(s, p); }).join(', ') + '</div>';
+    if (s.host === me)
+      html += '<div style="text-align:center;margin-top:10px"><button class="gstartbtn" data-trivstart="1">Start rounds</button></div>';
+    else html += '<div class="gs" style="text-align:center">host starts the rounds…</div>';
+    return { stat: stat, html: html };
+  }
+  if (!st || st.phase === 'lobby') return { stat: 'starting…', html: '' };
+  stat = 'round ' + st.round + '/' + TRIVIA_ROUNDS;
+  if (st.phase === 'question' && st.q) {
+    html = '<div class="trivq">' + escHtml(st.q.q) + '</div>';
+    var mine = (ganswers[s.id] || {})[me];
+    for (var i = 0; i < st.q.c.length; i++)
+      html += '<button class="trivchoice' + (mine === i ? ' picked' : '') + '" data-tqa="' + i + '">' +
+        escHtml(st.q.c[i]) + '</button>';
+    var n = Object.keys(ganswers[s.id] || {}).length;
+    html += '<div class="gs" style="text-align:center">' + n + '/' + s.players.length + ' answered</div>';
+  } else if (st.phase === 'reveal' && st.q) {
+    html = '<div class="trivq">' + escHtml(st.q.q) + '</div>';
+    var mine2 = (ganswers[s.id] || {})[me];
+    for (var j = 0; j < st.q.c.length; j++) {
+      var cls = 'trivchoice';
+      if (j === st.q.a) cls += ' right';
+      else if (mine2 === j) cls += ' wrong';
+      html += '<button class="' + cls + '" disabled>' + escHtml(st.q.c[j]) + '</button>';
+    }
+    html += '<div class="trivscores">' + Object.keys(st.scores || {}).sort(function (a, b) {
+      return (st.scores[b] || 0) - (st.scores[a] || 0);
+    }).map(function (p) {
+      return '<div>' + pname(s, p) + ': ' + (st.scores[p] || 0) + '</div>';
+    }).join('') + '</div>';
+  }
+  if (s.status === 'finished') {
+    stat = s.winner === 'draw' ? "it's a draw!" :
+      (s.winner === me ? 'you win! 🎉' : pname(s, s.winner) + ' wins! 🎉');
+  }
+  return { stat: stat, html: html };
+}
+function bindBoardButtons(s, st) {
+  var body = $('boardbody');
+  var tcells = body.querySelectorAll('button[data-ttt]');
+  for (var i = 0; i < tcells.length; i++)
+    tcells[i].addEventListener('click', function () { tttMove(+this.getAttribute('data-ttt')); });
+  var ccells = body.querySelectorAll('button[data-c4]');
+  for (var j = 0; j < ccells.length; j++)
+    ccells[j].addEventListener('click', function () { c4Move(+this.getAttribute('data-c4')); });
+  var qa = body.querySelectorAll('button[data-tqa]');
+  for (var k = 0; k < qa.length; k++)
+    qa[k].addEventListener('click', function () { triviaAnswer(+this.getAttribute('data-tqa')); });
+  var ts = body.querySelectorAll('button[data-trivstart]');
+  for (var m = 0; m < ts.length; m++)
+    ts[m].addEventListener('click', function () { triviaStart(openGameId); });
+  var sb = body.querySelectorAll('button.gstartbtn');
+  for (var n = 0; n < sb.length; n++)
+    sb[n].style.cssText = 'background:#3b5bd6;border:none;color:#fff;border-radius:8px;padding:8px 18px;font-size:14px;';
+}
+function bindGames() {
+  $('gamebtn').innerHTML = '🎮<span class="dot" style="display:none">●</span>';
+  $('gamebtn').addEventListener('click', function () {
+    $('gamespanel').classList.contains('open') ? closeGames() : openGames();
+  });
+  $('gclose').addEventListener('click', closeGames);
+  $('bclose').addEventListener('click', closeBoard);
+  $('gstart-ttt').addEventListener('click', function () { startGame('tictactoe'); });
+  $('gstart-c4').addEventListener('click', function () { startGame('connect4'); });
+  $('gstart-trivia').addEventListener('click', function () { startGame('trivia'); });
+}
+function clearGames() {
+  games = {}; gstates = {}; ganswers = {}; openGameId = null;
+  for (var id in triviaTimers) clearTimeout(triviaTimers[id]);
+  triviaTimers = {};
+  closeGames(); closeBoard();
+}
+
 /* ---------------- input: joystick / look / tap / keys ---------------- */
 var keys = {};
 var joyEl, stickEl, joyId = null, joyVec = { x: 0, y: 0 };
@@ -939,6 +1445,7 @@ async function init() {
   bindChat();
   bindHist();
   bindSettings();
+  bindGames();
   refreshLogin();
   $('roomname').textContent = 'room: ' + roomId;
   var seen = false;
