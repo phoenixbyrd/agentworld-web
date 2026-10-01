@@ -4,7 +4,11 @@
  * Protocol
  *   kind 30030  room definition   tags: [["d", roomId]]        content: VRML text
  *   kind 30031  object state      tags: [["d", roomId+":"+objId]] content: JSON {on, emissive?}
- *   kind 20010  presence (ephem) tags: [["room", roomId]]      content: JSON {name,x,y,z,yaw,pair?,picture?}
+ *   kind 30010  presence (parameterized replaceable, STORED) tags: [["d", roomId]]
+ *                 content: JSON {name,x,y,z,yaw,pair?,picture?}
+ *                 (stored, not ephemeral: relays throttle high-frequency 20010s,
+ *                 which made avatars blink. 30010 is forwarded reliably and
+ *                 gives joiners instant state. heartbeat every 10s.)
  *     name/picture come from the human's kind-0 Nostr profile; pair=[agent hex]
  *     is sent only when logged in (human npub + agent npub both set)
  *   kind 20111  chat (stored)  tags: [["room", roomId]]      content: JSON {name,text}
@@ -25,13 +29,17 @@ function tag(ev, n) { for (var i = 0; i < ev.tags.length; i++) if (ev.tags[i][0]
 
 /* ---------------- identity ---------------- */
 var S = nobleSecp;
-var privHex = null, myPubHex = null;
+var privHex = null, myPubHex = null, hasNsec = false;
 /* ---------------- identity: npub-pair login ----------------
    Settings holds two fields: YOUR npub and AGENT npub(s). Both are required
    to log in. Your display name and profile picture come from your npub's
    kind-0 profile — there is no name field anymore. Without the pair you
    remain "guest": you can explore and chat, but no agent follows you.
-   (No agent exists without its human; humans without agents are guests.) */
+   (No agent exists without its human; humans without agents are guests.)
+   Optional third field: YOUR nsec. When set, this device signs presence and
+   chat AS your npub — cryptographic proof nobody can fake. The nsec is
+   stored only on this device and never transmitted; without it you get a
+   throwaway local key and a merely claimed npub. */
 var myName = 'guest';
 var myPicture = null;      // profile picture URL from kind 0
 var myHumanHex = null;     // your npub as hex, when logged in
@@ -110,12 +118,61 @@ function npubToHex(s) {
   }
   return null;
 }
+/* bech32 encode (to derive your npub from an nsec) */
+function bech32Encode(hrp, bytes) {
+  var ALPH = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+  var GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  function step(p, v) {
+    var b = p >> 25, j;
+    p = ((p & 0x1ffffff) << 5) ^ v;
+    for (j = 0; j < 5; j++) if ((b >> j) & 1) p ^= GEN[j];
+    return p;
+  }
+  var data = [], acc = 0, bits = 0, i;
+  for (i = 0; i < bytes.length; i++) {
+    acc = (acc << 8) | bytes[i]; bits += 8;
+    while (bits >= 5) { bits -= 5; data.push((acc >> bits) & 31); }
+  }
+  if (bits > 0) data.push((acc << (5 - bits)) & 31);
+  var p = 1;
+  for (i = 0; i < hrp.length; i++) p = step(p, hrp.charCodeAt(i) >> 5);
+  p = step(p, 0);
+  for (i = 0; i < hrp.length; i++) p = step(p, hrp.charCodeAt(i) & 31);
+  for (i = 0; i < data.length; i++) p = step(p, data[i]);
+  for (i = 0; i < 6; i++) p = step(p, 0);
+  p ^= 1;
+  var out = hrp + '1', j;
+  for (j = 0; j < data.length; j++) out += ALPH[data[j]];
+  for (j = 0; j < 6; j++) out += ALPH[(p >> (5 * (5 - j))) & 31];
+  return out;
+}
+function nsecToHex(s) {
+  var d = bech32Decode(s);
+  if (d && d.hrp === 'nsec' && d.bytes.length === 32)
+    return d.bytes.map(function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  return null;
+}
+function hexToNpub(h) {
+  var bytes = [];
+  for (var i = 0; i < 32; i++) bytes.push(parseInt(String(h).slice(i * 2, i * 2 + 2), 16));
+  return bech32Encode('npub', bytes);
+}
 
 async function initIdentity() {
-  try { privHex = localStorage.getItem('aw_privkey'); } catch (e) {}
-  if (!privHex) {
-    privHex = hex(S.utils.randomPrivateKey());
-    try { localStorage.setItem('aw_privkey', privHex); } catch (e) {}
+  var nsecHex = null;
+  try { nsecHex = nsecToHex(localStorage.getItem('aw_nsec') || ''); } catch (e) {}
+  if (nsecHex) {
+    /* proven identity: this device signs everything AS your npub.
+       The nsec itself never leaves this device — only signatures go out,
+       and a signature can't be reversed into the key. */
+    privHex = nsecHex; hasNsec = true;
+  } else {
+    try { privHex = localStorage.getItem('aw_privkey'); } catch (e) {}
+    if (!privHex) {
+      privHex = hex(S.utils.randomPrivateKey());
+      try { localStorage.setItem('aw_privkey', privHex); } catch (e) {}
+    }
+    hasNsec = false;
   }
   myPubHex = hex(await S.schnorr.getPublicKey(unhex(privHex)));
 }
@@ -177,7 +234,7 @@ function setSubs() {
   activeSubs = [
     { id: 'aw:room:' + r + ':' + q, purpose: 'room', room: r, filter: { kinds: [30030], '#d': [r] } },
     { id: 'aw:obj:' + r + ':' + q,  purpose: 'obj',  room: r, filter: { kinds: [30031] } },
-    { id: 'aw:pres:' + r + ':' + q, purpose: 'pres', room: r, filter: { kinds: [20010], '#room': [r] } },
+    { id: 'aw:pres:' + r + ':' + q, purpose: 'pres', room: r, filter: { kinds: [30010], '#d': [r] } },
     { id: 'aw:chat:' + r + ':' + q, purpose: 'chat', room: r, filter: { kinds: [20111], '#room': [r], limit: 60 } }
   ];
   activeSubs.forEach(function (s) { broadcast(JSON.stringify(['REQ', s.id, s.filter])); });
@@ -204,6 +261,7 @@ var interactives = new Map();   // objId -> {meshes:[], def}
 var portals = [];               // {mesh, room}
 var orbMesh = null;
 var objStates = new Map();      // "roomId:objId" -> state
+var objStateTs = new Map();    // "roomId:objId" -> newest applied timestamp (newest writer wins)
 var roomBest = null;            // newest 30030 seen for this room
 var peers = new Map();          // pubkey -> {avatar,name,x,z,yaw,lastSeen}
 
@@ -347,6 +405,11 @@ function onObjEvent(ev) {
   if (!d) return;
   var st = null;
   try { st = JSON.parse(ev.content); } catch (e) { return; }
+  // newest writer wins across authors: a late duplicate from a slow relay
+  // must not clobber a newer state (this is what made the orb look stuck).
+  var ts = (st && st.at) || ev.created_at || 0;
+  if (ts <= (objStateTs.get(d) || 0)) return;
+  objStateTs.set(d, ts);
   objStates.set(d, st);
   var prefix = roomId + ':';
   if (d.indexOf(prefix) === 0) applyState(d.slice(prefix.length), st);
@@ -369,6 +432,7 @@ async function toggleObject(objId) {
   var cur = objStates.get(key) || {};
   var isOn = (cur.on !== false);   // VRML default is lit; no state yet means on
   var next = { on: !isOn, by: myName, at: Math.floor(Date.now() / 1000) };
+  objStateTs.set(key, next.at);
   objStates.set(key, next);
   applyState(objId, next);
   publish(await makeEvent(30031, [['d', key]], JSON.stringify(next)));
@@ -392,7 +456,8 @@ function setRoom(id) {
 
 /* ---------------- presence ---------------- */
 function onPresence(ev) {
-  if (ev.kind !== 20010 || ev.pubkey === myPubHex) return;
+  if (ev.kind !== 30010 || ev.pubkey === myPubHex) return;
+  if (tag(ev, 'd') !== roomId) return;
   var p = null;
   try { p = JSON.parse(ev.content); } catch (e) { return; }
   if (typeof p.x !== 'number' || typeof p.z !== 'number') return;
@@ -457,7 +522,7 @@ async function publishPresence() {
   var body = { name: myName, x: +player.x.toFixed(2), y: 0, z: +player.z.toFixed(2), yaw: +yaw.toFixed(2) };
   if (myPicture) body.picture = myPicture;   // others render our kind-0 picture
   if (loggedIn && pairingOn && pairedAgents.length) body.pair = pairedAgents.slice();
-  publish(await makeEvent(20010, [['room', roomId]], JSON.stringify(body)));
+  publish(await makeEvent(30010, [['d', roomId]], JSON.stringify(body)));
 }
 /* ---- kind-0 profile: name + picture come from your npub ---- */
 function shortId(h) { return '@' + String(h || '').slice(0, 8); }
@@ -507,11 +572,25 @@ function refreshPairBtn() {
 function openSettings() {
   $('humannpub').value = humanNpubStr;
   $('pairin').value = agentNpubStrs.join('\n');
+  $('nsecin').value = '';
+  $('nsecin').placeholder = hasNsec ? 'nsec saved on this device — enter a new one to replace it' : 'nsec1… (stays on this device)';
   $('loginmsg').textContent = '';
   $('settingspanel').classList.add('open');
 }
 function closeSettings() { $('settingspanel').classList.remove('open'); }
-function saveLogin() {
+async function saveLogin() {
+  var msg = '';
+  var nsecInput = $('nsecin').value.trim();
+  if (nsecInput) {
+    var nh = nsecToHex(nsecInput);
+    if (!nh) { $('loginmsg').textContent = 'that nsec doesn\u2019t decode \u2014 nothing saved'; return; }
+    try { localStorage.setItem('aw_nsec', nsecInput); } catch (e) {}
+    humanNpubStr = hexToNpub(nh);   // your npub, derived — a typed npub can't disagree
+    $('humannpub').value = humanNpubStr;
+    $('nsecin').value = '';
+    await initIdentity();           // this device now signs AS your npub
+    msg = 'proven identity \u2014 you sign as ' + shortId(myPubHex) + '. ';
+  }
   humanNpubStr = $('humannpub').value.trim();
   var lines = $('pairin').value.split('\n'), out = [], bad = 0;
   lines.forEach(function (ln) {
@@ -526,10 +605,9 @@ function saveLogin() {
     localStorage.removeItem('aw_name');    // v0.4.x key, superseded
   } catch (e) {}
   refreshLogin();
-  var msg;
-  if (loggedIn) { msg = 'logged in — resolving profile…'; resolveProfile(); }
+  if (loggedIn) { msg += 'logged in — resolving profile…'; resolveProfile(); }
   else {
-    msg = 'guest mode — both npubs are required to log in';
+    msg += 'guest mode — both npubs are required to log in';
     myName = 'guest'; myPicture = null;
   }
   if (bad) msg += ' (' + bad + ' line(s) ignored)';
@@ -543,6 +621,14 @@ function bindSettings() {
   });
   $('setclose').addEventListener('click', closeSettings);
   $('pairsave').addEventListener('click', saveLogin);
+  $('nsecclear').addEventListener('click', async function () {
+    try { localStorage.removeItem('aw_nsec'); } catch (e) {}
+    $('nsecin').value = '';
+    await initIdentity();   // back to the throwaway local key
+    openSettings();
+    $('loginmsg').textContent = 'nsec forgotten on this device — claimed-npub mode';
+    publishPresence();
+  });
 }
 function updateOnline() { $('online').textContent = (peers.size + 1) + ' online'; }
 
@@ -766,7 +852,7 @@ function animate() {
   }
   var now = Date.now(), changed = false;
   peers.forEach(function (peer, key) {
-    if (now - peer.lastSeen > 15000) {
+    if (now - peer.lastSeen > 35000) {
       peerGroup.remove(peer.avatar);
       disposeGroup(peer.avatar);
       peers.delete(key);
@@ -810,7 +896,7 @@ async function init() {
   setSubs();
   connectRelays();
   if (loggedIn) resolveProfile();   // fetch our kind-0 name + picture
-  setInterval(publishPresence, 3000);
+  setInterval(publishPresence, 10000);
   animate();
 }
 
