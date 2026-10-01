@@ -24,14 +24,60 @@ function tag(ev, n) { for (var i = 0; i < ev.tags.length; i++) if (ev.tags[i][0]
 /* ---------------- identity ---------------- */
 var S = nobleSecp;
 var privHex = null, myPubHex = null;
-var myName = 'James';
-try { myName = localStorage.getItem('aw_name') || 'James'; } catch (e) {}
-/* companion pairing: when on, our presence heartbeat carries pair=MICA_HEX
-   and Mica's bot stays in the world with us; when our heartbeat stops
-   (we leave), she goes dormant. */
-var MICA_HEX = '5c968cc62b867fcc364b1af21fa07d2bef33f356c8fb5d824bfdf5bbec65a8b0';
-var pairMica = true;
-try { pairMica = localStorage.getItem('aw_pair_mica') !== '0'; } catch (e) {}
+var myName = 'guest';
+try { myName = localStorage.getItem('aw_name') || 'guest'; } catch (e) {}
+/* companion pairing: our heartbeat carries pair=[agent hex pubkeys] when on.
+   Each agent watches for its own key and stays only while its human is here.
+   Nothing is hard-coded — agents are entered in Settings like everyone else. */
+var pairingOn = true;
+try { pairingOn = localStorage.getItem('aw_pair_mica') !== '0'; } catch (e) {}
+var pairedAgents = [];   // hex pubkeys, from Settings
+try {
+  var _sp = JSON.parse(localStorage.getItem('aw_pairs') || '[]');
+  if (Array.isArray(_sp)) pairedAgents = _sp.filter(function (x) { return /^[0-9a-f]{64}$/.test(x); });
+} catch (e) {}
+
+/* bech32 (for npub -> hex) */
+function bech32Decode(str) {
+  var ALPH = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+  var s = String(str).trim();
+  var pos = s.lastIndexOf('1');
+  if (pos < 1 || pos + 7 > s.length) return null;
+  var hrp = s.slice(0, pos).toLowerCase(), data = [], i, j;
+  for (i = pos + 1; i < s.length; i++) {
+    var d = ALPH.indexOf(s[i].toLowerCase());
+    if (d < 0) return null;
+    data.push(d);
+  }
+  var vals = [];
+  for (i = 0; i < hrp.length; i++) vals.push(hrp.charCodeAt(i) >> 5);
+  vals.push(0);
+  for (i = 0; i < hrp.length; i++) vals.push(hrp.charCodeAt(i) & 31);
+  var chk = vals.concat(data);
+  var GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3], p = 1;
+  for (i = 0; i < chk.length; i++) {
+    var b = p >> 25;
+    p = ((p & 0x1ffffff) << 5) ^ chk[i];
+    for (j = 0; j < 5; j++) if ((b >> j) & 1) p ^= GEN[j];
+  }
+  if (p !== 1) return null;
+  var payload = data.slice(0, -6), acc = 0, bits = 0, out = [];
+  for (i = 0; i < payload.length; i++) {
+    acc = (acc << 5) | payload[i]; bits += 5;
+    while (bits >= 8) { bits -= 8; out.push((acc >> bits) & 255); }
+  }
+  return { hrp: hrp, bytes: out };
+}
+function npubToHex(s) {
+  s = String(s).trim();
+  if (/^[0-9a-fA-F]{64}$/.test(s)) return s.toLowerCase();
+  if (s.toLowerCase().indexOf('npub1') === 0) {
+    var d = bech32Decode(s);
+    if (d && d.hrp === 'npub' && d.bytes.length === 32)
+      return d.bytes.map(function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  }
+  return null;
+}
 
 async function initIdentity() {
   try { privHex = localStorage.getItem('aw_privkey'); } catch (e) {}
@@ -356,16 +402,51 @@ function makeAvatar(name) {
 async function publishPresence() {
   if (!myPubHex) return;
   var body = { name: myName, x: +player.x.toFixed(2), y: 0, z: +player.z.toFixed(2), yaw: +yaw.toFixed(2) };
-  if (pairMica) body.pair = MICA_HEX;
+  if (pairingOn && pairedAgents.length) body.pair = pairedAgents.slice();
   publish(await makeEvent(20010, [['room', roomId]], JSON.stringify(body)));
 }
 function togglePair() {
-  pairMica = !pairMica;
-  try { localStorage.setItem('aw_pair_mica', pairMica ? '1' : '0'); } catch (e) {}
+  pairingOn = !pairingOn;
+  try { localStorage.setItem('aw_pair_mica', pairingOn ? '1' : '0'); } catch (e) {}
+  refreshPairBtn();
+  publishPresence();  // heartbeat immediately so agents arrive/leave at once
+  sysLine(pairingOn ? 'agent pairing on.' : 'agent pairing off.');
+}
+function refreshPairBtn() {
   var b = $('pairbtn');
-  if (b) { b.classList.toggle('off', !pairMica); b.title = pairMica ? 'Mica is paired — tap to dismiss her' : 'Pair Mica to join you'; }
-  publishPresence();  // heartbeat immediately so she arrives/leaves at once
-  sysLine(pairMica ? 'Mica pairing on — she\'ll join you.' : 'Mica pairing off.');
+  if (!b) return;
+  b.classList.toggle('off', !pairingOn);
+  b.title = !pairedAgents.length ? 'no agents paired — open settings (⚙️)' :
+    (pairingOn ? 'agents paired — tap to dismiss them' : 'pairing off — tap to call your agents');
+}
+/* ---------------- settings ---------------- */
+function openSettings() {
+  $('pairin').value = pairedAgents.join('\n');
+  $('pairmsg').textContent = '';
+  $('settingspanel').classList.add('open');
+}
+function closeSettings() { $('settingspanel').classList.remove('open'); }
+function savePairs() {
+  var lines = $('pairin').value.split('\n');
+  var out = [], bad = 0;
+  lines.forEach(function (ln) {
+    ln = ln.trim(); if (!ln) return;
+    var h = npubToHex(ln);
+    if (h) { if (out.indexOf(h) < 0) out.push(h); } else bad++;
+  });
+  pairedAgents = out;
+  try { localStorage.setItem('aw_pairs', JSON.stringify(out)); } catch (e) {}
+  $('pairmsg').textContent = bad ? ('saved, ' + bad + ' line(s) ignored') :
+    (out.length ? 'saved — ' + out.length + ' agent(s) paired' : 'saved — no agents paired');
+  refreshPairBtn();
+  publishPresence();
+}
+function bindSettings() {
+  $('setbtn').addEventListener('click', function () {
+    $('settingspanel').classList.contains('open') ? closeSettings() : openSettings();
+  });
+  $('setclose').addEventListener('click', closeSettings);
+  $('pairsave').addEventListener('click', savePairs);
 }
 function updateOnline() { $('online').textContent = (peers.size + 1) + ' online'; }
 
@@ -413,9 +494,10 @@ function bindHist() {
   });
   var pb = $('pairbtn');
   if (pb) {
-    pb.classList.toggle('off', !pairMica);
-    pb.title = pairMica ? 'Mica is paired — tap to dismiss her' : 'Pair Mica to join you';
-    pb.addEventListener('click', togglePair);
+    refreshPairBtn();
+    pb.addEventListener('click', function () {
+      if (!pairedAgents.length) openSettings(); else togglePair();
+    });
   }
 }
 
@@ -493,7 +575,7 @@ function bindChat() {
   $('sendbtn').addEventListener('click', sendChat);
   $('chatin').addEventListener('keydown', function (e) { if (e.key === 'Enter') sendChat(); });
   $('namesave').addEventListener('click', function () {
-    var v = $('namein').value.trim().slice(0, 24) || 'James';
+    var v = $('namein').value.trim().slice(0, 24) || 'guest';
     myName = v;
     try { localStorage.setItem('aw_name', v); } catch (e) {}
     sysLine('name set to ' + v);
@@ -624,6 +706,7 @@ async function init() {
   bindLook();
   bindChat();
   bindHist();
+  bindSettings();
   $('namein').value = myName;
   $('roomname').textContent = 'room: ' + roomId;
   var seen = false;

@@ -46,6 +46,20 @@
   #histbtn.active { opacity:1; background:rgba(255,255,255,.14); border-radius:8px; }
   #pairbtn { background:none; border:none; font-size:18px; opacity:1; padding:2px 6px; }
   #pairbtn.off { opacity:.35; filter:grayscale(1); }
+  #setbtn { background:none; border:none; font-size:18px; opacity:.75; padding:2px 6px; }
+  #settingspanel { position:fixed; top:44px; right:8px; z-index:30; width:min(320px, 92vw);
+             background:rgba(10,12,18,.96); border:1px solid rgba(255,255,255,.14);
+             border-radius:12px; padding:12px; display:none; color:#e8eaf0; }
+  #settingspanel.open { display:block; }
+  #settingspanel .srow { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+  #settingspanel b { font-size:15px; }
+  #setclose { background:none; border:none; color:#e8eaf0; font-size:16px; opacity:.7; }
+  #settingspanel label { font-size:13px; display:block; margin:6px 0 4px; }
+  #settingspanel .sh { opacity:.6; font-size:12px; }
+  #pairin { width:100%; box-sizing:border-box; background:#141821; border:1px solid rgba(255,255,255,.15);
+            color:#e8eaf0; border-radius:8px; padding:8px; font-size:13px; resize:vertical; }
+  #pairsave { background:#3b5bd6; border:none; color:#fff; border-radius:8px; padding:8px 16px; font-size:14px; }
+  #pairmsg { font-size:12px; opacity:.7; margin-left:8px; }
 
   #joy { position:fixed; left:18px; bottom:86px; width:112px; height:112px; z-index:10;
          border-radius:50%; background:rgba(255,255,255,.07);
@@ -65,7 +79,13 @@
 <body>
 <div id="c"></div>
 
-<div id="topbar"><span id="roomname">room: lobby</span><button id="histbtn" title="chat history">💬</button><button id="pairbtn" title="Mica is paired — tap to dismiss her">🤖</button><span id="online">1 online</span></div>
+<div id="topbar"><span id="roomname">room: lobby</span><button id="histbtn" title="chat history">💬</button><button id="pairbtn" title="paired agents">🤖</button><button id="setbtn" title="settings">⚙️</button><span id="online">1 online</span></div>
+<div id="settingspanel">
+  <div class="srow"><b>Settings</b><button id="setclose">✕</button></div>
+  <label>Paired agents <span class="sh">— they join you only while you're here</span></label>
+  <textarea id="pairin" rows="3" placeholder="npub1… or hex pubkey, one per line"></textarea>
+  <div class="srow"><span><button id="pairsave">save</button><span id="pairmsg"></span></span></div>
+</div>
 <div id="namerow"><input id="namein" maxlength="24" placeholder="display name"><button id="namesave">save</button></div>
 <div id="hint">left stick: walk &nbsp;·&nbsp; drag right side: look &nbsp;·&nbsp; tap the orb &amp; the glowing portal</div>
 <div id="chatlog"></div>
