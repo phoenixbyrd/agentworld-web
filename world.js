@@ -552,12 +552,14 @@ function makeAvatar(name, av) {
   var handGeo = new THREE.SphereGeometry(0.09, 10, 8);
   var handL = new THREE.Mesh(handGeo, skin); handL.position.set(-0.47, 0.72, 0); g.add(handL);
   var handR = new THREE.Mesh(handGeo, skin); handR.position.set(0.47, 0.72, 0); g.add(handR);
-  // head + eyes (face looks along +z, matching avatar yaw)
+  // head + eyes: the face looks along local -z, which is where the
+  // camera looks when rotation.y = yaw (forward = (-sin yaw, -cos yaw)),
+  // so the eyes end up on the side the avatar is actually facing.
   var head = new THREE.Mesh(new THREE.SphereGeometry(0.26, 18, 14), skin);
   head.position.y = 1.72; g.add(head);
   var eyeGeo = new THREE.SphereGeometry(0.035, 8, 6);
-  var eyeL = new THREE.Mesh(eyeGeo, dark); eyeL.position.set(-0.09, 1.76, 0.23); g.add(eyeL);
-  var eyeR = new THREE.Mesh(eyeGeo, dark); eyeR.position.set(0.09, 1.76, 0.23); g.add(eyeR);
+  var eyeL = new THREE.Mesh(eyeGeo, dark); eyeL.position.set(-0.09, 1.76, -0.23); g.add(eyeL);
+  var eyeR = new THREE.Mesh(eyeGeo, dark); eyeR.position.set(0.09, 1.76, -0.23); g.add(eyeR);
   var cv = document.createElement('canvas');
   cv.width = 256; cv.height = 64;
   var cx = cv.getContext('2d');
