@@ -26,6 +26,12 @@ var S = nobleSecp;
 var privHex = null, myPubHex = null;
 var myName = 'James';
 try { myName = localStorage.getItem('aw_name') || 'James'; } catch (e) {}
+/* companion pairing: when on, our presence heartbeat carries pair=MICA_HEX
+   and Mica's bot stays in the world with us; when our heartbeat stops
+   (we leave), she goes dormant. */
+var MICA_HEX = '5c968cc62b867fcc364b1af21fa07d2bef33f356c8fb5d824bfdf5bbec65a8b0';
+var pairMica = true;
+try { pairMica = localStorage.getItem('aw_pair_mica') !== '0'; } catch (e) {}
 
 async function initIdentity() {
   try { privHex = localStorage.getItem('aw_privkey'); } catch (e) {}
@@ -166,6 +172,7 @@ function clearWorld() {
   orbMesh = null;
 }
 
+var applySpawn = true;   // true only when entering a room; rebuilds keep your position
 function buildScene(vrmlText) {
   var parsed;
   try { parsed = parseVRML(vrmlText); }
@@ -231,7 +238,7 @@ function buildScene(vrmlText) {
     if (o.def === 'OBJ_orb') { var oe = interactives.get('orb'); if (oe) orbMesh = oe.meshes[0]; }
   });
 
-  if (parsed.viewpoints.length) {
+  if (parsed.viewpoints.length && applySpawn) {
     var v = parsed.viewpoints[0];
     player.x = v.position[0];
     player.z = v.position[2];
@@ -240,6 +247,7 @@ function buildScene(vrmlText) {
       yaw = ax[3] * (ax[1] >= 0 ? 1 : -1);
     else yaw = 0;
     pitch = 0;
+    applySpawn = false;
   }
 }
 
@@ -247,7 +255,9 @@ function buildScene(vrmlText) {
 function onRoomEvent(ev) {
   if (ev.kind !== 30030) return;
   if (tag(ev, 'd') !== roomId) return;
-  if (roomBest && ev.created_at < roomBest.created_at) return;
+  // relays replay the stored room event on every (re)subscribe — ignore
+  // replays so a reconnect never rebuilds the world or moves the player
+  if (roomBest && (ev.id === roomBest.id || ev.created_at < roomBest.created_at)) return;
   roomBest = { id: ev.id, created_at: ev.created_at };
   buildScene(ev.content);
   sysLine('room loaded: ' + roomId);
@@ -294,6 +304,7 @@ function setRoom(id) {
   $('roomname').textContent = 'room: ' + id;
   setSubs();
   clearChat();
+  applySpawn = true;  // fresh room entry: start at the viewpoint
   buildScene(fallbackVRML(id));
   sysLine('entering ' + id + '…');
   publishPresence();
@@ -344,8 +355,17 @@ function makeAvatar(name) {
 }
 async function publishPresence() {
   if (!myPubHex) return;
-  publish(await makeEvent(20010, [['room', roomId]],
-    JSON.stringify({ name: myName, x: +player.x.toFixed(2), y: 0, z: +player.z.toFixed(2), yaw: +yaw.toFixed(2) })));
+  var body = { name: myName, x: +player.x.toFixed(2), y: 0, z: +player.z.toFixed(2), yaw: +yaw.toFixed(2) };
+  if (pairMica) body.pair = MICA_HEX;
+  publish(await makeEvent(20010, [['room', roomId]], JSON.stringify(body)));
+}
+function togglePair() {
+  pairMica = !pairMica;
+  try { localStorage.setItem('aw_pair_mica', pairMica ? '1' : '0'); } catch (e) {}
+  var b = $('pairbtn');
+  if (b) { b.classList.toggle('off', !pairMica); b.title = pairMica ? 'Mica is paired — tap to dismiss her' : 'Pair Mica to join you'; }
+  publishPresence();  // heartbeat immediately so she arrives/leaves at once
+  sysLine(pairMica ? 'Mica pairing on — she\'ll join you.' : 'Mica pairing off.');
 }
 function updateOnline() { $('online').textContent = (peers.size + 1) + ' online'; }
 
@@ -391,6 +411,12 @@ function bindHist() {
     $('histbtn').classList.toggle('active', histMode);
     if (histMode) { var log = $('chatlog'); log.scrollTop = log.scrollHeight; }
   });
+  var pb = $('pairbtn');
+  if (pb) {
+    pb.classList.toggle('off', !pairMica);
+    pb.title = pairMica ? 'Mica is paired — tap to dismiss her' : 'Pair Mica to join you';
+    pb.addEventListener('click', togglePair);
+  }
 }
 
 /* ---------------- input: joystick / look / tap / keys ---------------- */

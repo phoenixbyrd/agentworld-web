@@ -44,6 +44,8 @@
   @keyframes chatfade { to { opacity:0; } }
   #histbtn { background:none; border:none; font-size:18px; opacity:.75; padding:2px 6px; }
   #histbtn.active { opacity:1; background:rgba(255,255,255,.14); border-radius:8px; }
+  #pairbtn { background:none; border:none; font-size:18px; opacity:1; padding:2px 6px; }
+  #pairbtn.off { opacity:.35; filter:grayscale(1); }
 
   #joy { position:fixed; left:18px; bottom:86px; width:112px; height:112px; z-index:10;
          border-radius:50%; background:rgba(255,255,255,.07);
@@ -63,7 +65,7 @@
 <body>
 <div id="c"></div>
 
-<div id="topbar"><span id="roomname">room: lobby</span><button id="histbtn" title="chat history">💬</button><span id="online">1 online</span></div>
+<div id="topbar"><span id="roomname">room: lobby</span><button id="histbtn" title="chat history">💬</button><button id="pairbtn" title="Mica is paired — tap to dismiss her">🤖</button><span id="online">1 online</span></div>
 <div id="namerow"><input id="namein" maxlength="24" placeholder="display name"><button id="namesave">save</button></div>
 <div id="hint">left stick: walk &nbsp;·&nbsp; drag right side: look &nbsp;·&nbsp; tap the orb &amp; the glowing portal</div>
 <div id="chatlog"></div>
