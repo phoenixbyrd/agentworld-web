@@ -458,6 +458,10 @@ function setRoom(id) {
 function onPresence(ev) {
   if (ev.kind !== 30010 || ev.pubkey === myPubHex) return;
   if (tag(ev, 'd') !== roomId) return;
+  /* stored presence is replayed by relays long after its author left —
+     trust the event's own clock, not receipt time, or ghosts linger */
+  var age = Date.now() / 1000 - (ev.created_at || 0);
+  if (age < -30 || age > 35) return;
   var p = null;
   try { p = JSON.parse(ev.content); } catch (e) { return; }
   if (typeof p.x !== 'number' || typeof p.z !== 'number') return;
