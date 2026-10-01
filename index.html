@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>AgentWorld</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#0b0d12;
+               font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
+               -webkit-user-select:none; user-select:none; overscroll-behavior:none; }
+  #c { position:fixed; inset:0; }
+  #c canvas { display:block; touch-action:none; }
+
+  #topbar { position:fixed; top:0; left:0; right:0; z-index:10;
+            display:flex; align-items:center; gap:10px;
+            padding:8px 12px; background:rgba(8,10,16,.78); color:#e8eaf0;
+            font-size:15px; border-bottom:1px solid rgba(255,255,255,.08); }
+  #roomname { font-weight:600; }
+  #online { margin-left:auto; opacity:.7; font-size:13px; }
+
+  #namerow { position:fixed; top:41px; left:0; right:0; z-index:10;
+             display:flex; gap:8px; padding:6px 12px;
+             background:rgba(8,10,16,.55); }
+  #namerow input { flex:1; background:#141821; border:1px solid rgba(255,255,255,.15);
+                   color:#e8eaf0; border-radius:8px; padding:7px 10px; font-size:14px; }
+  #namerow button { background:#2a3550; border:none; color:#fff;
+                    border-radius:8px; padding:7px 14px; font-size:14px; }
+
+  #hint { position:fixed; top:92px; left:0; right:0; z-index:9; pointer-events:none;
+          text-align:center; color:#cfd4e0; font-size:13px;
+          text-shadow:0 1px 4px #000; padding:0 16px; }
+
+  #chatlog { position:fixed; left:140px; right:10px; bottom:150px; z-index:9;
+             display:flex; flex-direction:column; gap:4px; pointer-events:none;
+             max-height:38%; overflow:hidden; justify-content:flex-end; }
+  #chatlog.history { pointer-events:auto; overflow-y:auto; justify-content:flex-start;
+                    max-height:56%; background:rgba(8,10,16,.85); border:1px solid rgba(255,255,255,.12);
+                    border-radius:12px; padding:8px; -webkit-overflow-scrolling:touch; }
+  #chatlog.history .chatline { animation:none; }
+  .chatline { background:rgba(8,10,16,.72); color:#e8eaf0; padding:6px 10px;
+              border-radius:10px; font-size:14px; width:fit-content; max-width:100%;
+              word-break:break-word; animation:chatfade 1s ease 16s forwards; }
+  .chatline.sys { color:#9fd8ff; font-style:italic; font-size:13px; }
+  @keyframes chatfade { to { opacity:0; } }
+  #histbtn { background:none; border:none; font-size:18px; opacity:.75; padding:2px 6px; }
+  #histbtn.active { opacity:1; background:rgba(255,255,255,.14); border-radius:8px; }
+
+  #joy { position:fixed; left:18px; bottom:86px; width:112px; height:112px; z-index:10;
+         border-radius:50%; background:rgba(255,255,255,.07);
+         border:1px solid rgba(255,255,255,.25); touch-action:none; }
+  #stick { position:absolute; left:36px; top:36px; width:40px; height:40px;
+           border-radius:50%; background:rgba(255,255,255,.38); }
+
+  #chatrow { position:fixed; left:0; right:0; bottom:0; z-index:10;
+             display:flex; gap:8px; padding:10px; padding-bottom:calc(10px + env(safe-area-inset-bottom));
+             background:rgba(8,10,16,.88); border-top:1px solid rgba(255,255,255,.08); }
+  #chatin { flex:1; background:#141821; border:1px solid rgba(255,255,255,.15);
+            color:#e8eaf0; border-radius:10px; padding:10px 12px; font-size:16px; }
+  #sendbtn { background:#3b5bd6; border:none; color:#fff; border-radius:10px;
+             padding:0 18px; font-size:18px; }
+</style>
+</head>
+<body>
+<div id="c"></div>
+
+<div id="topbar"><span id="roomname">room: lobby</span><button id="histbtn" title="chat history">💬</button><span id="online">1 online</span></div>
+<div id="namerow"><input id="namein" maxlength="24" placeholder="display name"><button id="namesave">save</button></div>
+<div id="hint">left stick: walk &nbsp;·&nbsp; drag right side: look &nbsp;·&nbsp; tap the orb &amp; the glowing portal</div>
+<div id="chatlog"></div>
+<div id="joy"><div id="stick"></div></div>
+<div id="chatrow"><input id="chatin" maxlength="280" placeholder="say something…" autocomplete="off"><button id="sendbtn">➤</button></div>
+
+<script src="three.min.js"></script>
+<script src="secp256k1.bundle.js"></script>
+<script src="vrml.js"></script>
+<script src="world.js"></script>
+</body>
+</html>
