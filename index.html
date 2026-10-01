@@ -86,6 +86,8 @@
   <div class="sh">Saved only on this phone, never sent anywhere. With it, your presence and chat are signed as your npub — nobody can fake you. Without it you get a throwaway key and a claimed npub. <button id="nsecclear" class="linklike">forget nsec</button></div>
   <label>Agent npub <span class="sh">— your companion, joins only while you're here</span></label>
   <textarea id="pairin" rows="2" placeholder="npub1… (one per line)"></textarea>
+  <label>Your look <span class="sh">— everyone sees this</span></label>
+  <div class="srow"><span>skin <input id="avskin" type="color" value="#c68642"></span><span>shirt <input id="avshirt" type="color" value="#4a90d9"></span><span>pants <input id="avpants" type="color" value="#2c3e50"></span></div>
   <div class="srow"><span><button id="pairsave">save</button><span id="loginmsg"></span></span></div>
 </div>
 <div id="hint">left stick: walk &nbsp;·&nbsp; drag right side: look &nbsp;·&nbsp; tap the orb &amp; the glowing portal</div>
@@ -96,6 +98,6 @@
 <script src="three.min.js"></script>
 <script src="secp256k1.bundle.js"></script>
 <script src="vrml.js"></script>
-<script src="world.js?v=0.6.2"></script>
+<script src="world.js?v=0.6.3"></script>
 </body>
 </html>

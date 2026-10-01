@@ -69,6 +69,23 @@ function refreshLogin() {
   if (!loggedIn) { myName = 'guest'; myPicture = null; }
   return loggedIn;
 }
+/* ---------------- avatar look: skin/shirt/pants, shared via presence ---- */
+var AV_DEFAULTS = { skin: '#c68642', shirt: '#4a90d9', pants: '#2c3e50' };
+var avatarColors = null;
+try { avatarColors = JSON.parse(localStorage.getItem('aw_avatar') || 'null'); } catch (e) {}
+if (!avatarColors || typeof avatarColors !== 'object') avatarColors = null;
+function cleanHex(v, fb) {
+  v = String(v || '').trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(v) ? v : fb;
+}
+function readAvatarInputs() {
+  return {
+    skin: cleanHex($('avskin').value, AV_DEFAULTS.skin),
+    shirt: cleanHex($('avshirt').value, AV_DEFAULTS.shirt),
+    pants: cleanHex($('avpants').value, AV_DEFAULTS.pants)
+  };
+}
+
 /* companion pairing: our heartbeat carries pair=[agent hex pubkeys] when
    logged in and pairing is on. Each agent watches for its own key and stays
    only while its human is here. Nothing is hard-coded. */
@@ -466,15 +483,25 @@ function onPresence(ev) {
   try { p = JSON.parse(ev.content); } catch (e) { return; }
   if (typeof p.x !== 'number' || typeof p.z !== 'number') return;
   var peer = peers.get(ev.pubkey);
+  var colKey = JSON.stringify((p && p.avatar) || null);
   if (!peer) {
-    var av = makeAvatar(p.name || 'guest');
+    var av = makeAvatar(p.name || 'guest', p.avatar);
     av.position.set(p.x, 0, p.z);
     peerGroup.add(av);
-    peer = { avatar: av, name: (p.name || 'guest').slice(0, 24), x: p.x, z: p.z, yaw: p.yaw || 0, lastSeen: Date.now(), picUrl: null, picSprite: null };
+    peer = { avatar: av, name: (p.name || 'guest').slice(0, 24), x: p.x, z: p.z, yaw: p.yaw || 0, lastSeen: Date.now(), picUrl: null, picSprite: null, colKey: colKey };
     peers.set(ev.pubkey, peer);
     sysLine(peer.name + ' entered');
   } else {
     peer.x = p.x; peer.z = p.z; peer.yaw = p.yaw || 0; peer.lastSeen = Date.now();
+    if (peer.colKey !== colKey) {
+      /* they changed their look: rebuild the avatar live */
+      peerGroup.remove(peer.avatar);
+      peer.avatar = makeAvatar(peer.name, p.avatar);
+      peer.avatar.position.set(peer.x, 0, peer.z);
+      peerGroup.add(peer.avatar);
+      peer.colKey = colKey;
+      peer.picUrl = null; peer.picSprite = null;  // re-attach picture below
+    }
   }
   setPeerPicture(peer, (p && typeof p.picture === 'string') ? p.picture : null);
   updateOnline();
@@ -498,17 +525,36 @@ function setPeerPicture(peer, url) {
     }, undefined, function () { peer.picUrl = 'bad'; });
   } catch (e) { peer.picUrl = 'bad'; }
 }
-function makeAvatar(name) {
+function makeAvatar(name, av) {
   var g = new THREE.Group();
   var h = 0;
   for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-  var mat = new THREE.MeshStandardMaterial({ color: new THREE.Color('hsl(' + (h % 360) + ',60%,55%)'), roughness: 0.6 });
-  var body = new THREE.Mesh(new THREE.CapsuleGeometry(0.32, 0.85, 6, 14), mat);
-  body.position.y = 0.95;
-  g.add(body);
-  var head = new THREE.Mesh(new THREE.SphereGeometry(0.26, 18, 14), mat);
-  head.position.y = 1.78;
-  g.add(head);
+  av = (av && typeof av === 'object') ? av : {};
+  var skins = ['#f1c9a5', '#e0ac69', '#c68642', '#8d5524', '#5c3a21', '#3b2314'];
+  var shirt = new THREE.MeshStandardMaterial({ color: new THREE.Color(cleanHex(av.shirt, null) || ('hsl(' + (h % 360) + ',60%,55%)')), roughness: 0.7 });
+  var skin = new THREE.MeshStandardMaterial({ color: new THREE.Color(cleanHex(av.skin, null) || skins[h % skins.length]), roughness: 0.6 });
+  var pants = new THREE.MeshStandardMaterial({ color: new THREE.Color(cleanHex(av.pants, null) || ('hsl(' + (h % 360) + ',25%,28%)')), roughness: 0.8 });
+  var dark = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.5 });
+  // legs
+  var legGeo = new THREE.CylinderGeometry(0.11, 0.13, 0.55, 10);
+  var legL = new THREE.Mesh(legGeo, pants); legL.position.set(-0.14, 0.28, 0); g.add(legL);
+  var legR = new THREE.Mesh(legGeo, pants); legR.position.set(0.14, 0.28, 0); g.add(legR);
+  // torso
+  var torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.30, 0.55, 6, 14), shirt);
+  torso.position.y = 0.95; g.add(torso);
+  // arms + hands
+  var armGeo = new THREE.CapsuleGeometry(0.09, 0.5, 4, 10);
+  var armL = new THREE.Mesh(armGeo, shirt); armL.position.set(-0.42, 1.05, 0); armL.rotation.z = 0.15; g.add(armL);
+  var armR = new THREE.Mesh(armGeo, shirt); armR.position.set(0.42, 1.05, 0); armR.rotation.z = -0.15; g.add(armR);
+  var handGeo = new THREE.SphereGeometry(0.09, 10, 8);
+  var handL = new THREE.Mesh(handGeo, skin); handL.position.set(-0.47, 0.72, 0); g.add(handL);
+  var handR = new THREE.Mesh(handGeo, skin); handR.position.set(0.47, 0.72, 0); g.add(handR);
+  // head + eyes (face looks along +z, matching avatar yaw)
+  var head = new THREE.Mesh(new THREE.SphereGeometry(0.26, 18, 14), skin);
+  head.position.y = 1.72; g.add(head);
+  var eyeGeo = new THREE.SphereGeometry(0.035, 8, 6);
+  var eyeL = new THREE.Mesh(eyeGeo, dark); eyeL.position.set(-0.09, 1.76, 0.23); g.add(eyeL);
+  var eyeR = new THREE.Mesh(eyeGeo, dark); eyeR.position.set(0.09, 1.76, 0.23); g.add(eyeR);
   var cv = document.createElement('canvas');
   cv.width = 256; cv.height = 64;
   var cx = cv.getContext('2d');
@@ -525,6 +571,7 @@ async function publishPresence() {
   if (!myPubHex) return;
   var body = { name: myName, x: +player.x.toFixed(2), y: 0, z: +player.z.toFixed(2), yaw: +yaw.toFixed(2) };
   if (myPicture) body.picture = myPicture;   // others render our kind-0 picture
+  if (avatarColors) body.avatar = avatarColors;  // our look: skin/shirt/pants
   if (loggedIn && pairingOn && pairedAgents.length) body.pair = pairedAgents.slice();
   publish(await makeEvent(30010, [['d', roomId]], JSON.stringify(body)));
 }
@@ -578,6 +625,10 @@ function openSettings() {
   $('pairin').value = agentNpubStrs.join('\n');
   $('nsecin').value = '';
   $('nsecin').placeholder = hasNsec ? 'nsec saved on this device — enter a new one to replace it' : 'nsec1… (stays on this device)';
+  var ac = avatarColors || AV_DEFAULTS;
+  $('avskin').value = cleanHex(ac.skin, AV_DEFAULTS.skin);
+  $('avshirt').value = cleanHex(ac.shirt, AV_DEFAULTS.shirt);
+  $('avpants').value = cleanHex(ac.pants, AV_DEFAULTS.pants);
   $('loginmsg').textContent = '';
   $('settingspanel').classList.add('open');
 }
@@ -608,6 +659,8 @@ async function saveLogin() {
     localStorage.removeItem('aw_pairs');   // v0.4.x key, superseded
     localStorage.removeItem('aw_name');    // v0.4.x key, superseded
   } catch (e) {}
+  avatarColors = readAvatarInputs();
+  try { localStorage.setItem('aw_avatar', JSON.stringify(avatarColors)); } catch (e) {}
   refreshLogin();
   if (loggedIn) { msg += 'logged in — resolving profile…'; resolveProfile(); }
   else {
