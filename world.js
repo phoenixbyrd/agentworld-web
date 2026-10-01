@@ -4,7 +4,9 @@
  * Protocol
  *   kind 30030  room definition   tags: [["d", roomId]]        content: VRML text
  *   kind 30031  object state      tags: [["d", roomId+":"+objId]] content: JSON {on, emissive?}
- *   kind 20010  presence (ephem) tags: [["room", roomId]]      content: JSON {name,x,y,z,yaw}
+ *   kind 20010  presence (ephem) tags: [["room", roomId]]      content: JSON {name,x,y,z,yaw,pair?,picture?}
+ *     name/picture come from the human's kind-0 Nostr profile; pair=[agent hex]
+ *     is sent only when logged in (human npub + agent npub both set)
  *   kind 20111  chat (stored)  tags: [["room", roomId]]      content: JSON {name,text}
  *     (regular event so relays keep history; sub uses limit:60 for backfill + live)
  */
@@ -24,18 +26,48 @@ function tag(ev, n) { for (var i = 0; i < ev.tags.length; i++) if (ev.tags[i][0]
 /* ---------------- identity ---------------- */
 var S = nobleSecp;
 var privHex = null, myPubHex = null;
+/* ---------------- identity: npub-pair login ----------------
+   Settings holds two fields: YOUR npub and AGENT npub(s). Both are required
+   to log in. Your display name and profile picture come from your npub's
+   kind-0 profile — there is no name field anymore. Without the pair you
+   remain "guest": you can explore and chat, but no agent follows you.
+   (No agent exists without its human; humans without agents are guests.) */
 var myName = 'guest';
-try { myName = localStorage.getItem('aw_name') || 'guest'; } catch (e) {}
-/* companion pairing: our heartbeat carries pair=[agent hex pubkeys] when on.
-   Each agent watches for its own key and stays only while its human is here.
-   Nothing is hard-coded — agents are entered in Settings like everyone else. */
+var myPicture = null;      // profile picture URL from kind 0
+var myHumanHex = null;     // your npub as hex, when logged in
+var loggedIn = false;      // both npubs present and valid
+var humanNpubStr = '';
+var agentNpubStrs = [];    // raw strings as typed (npub or hex)
+try { humanNpubStr = localStorage.getItem('aw_human_npub') || ''; } catch (e) {}
+try {
+  var _an = JSON.parse(localStorage.getItem('aw_agent_npubs') || '[]');
+  if (Array.isArray(_an)) agentNpubStrs = _an.filter(function (x) { return typeof x === 'string' && x.trim(); });
+} catch (e) {}
+/* migrate v0.4.x: aw_pairs held agent hex keys */
+try {
+  if (!agentNpubStrs.length) {
+    var _sp = JSON.parse(localStorage.getItem('aw_pairs') || '[]');
+    if (Array.isArray(_sp)) agentNpubStrs = _sp.filter(function (x) { return /^[0-9a-f]{64}$/.test(x); });
+  }
+} catch (e) {}
+function refreshLogin() {
+  myHumanHex = npubToHex(humanNpubStr);
+  pairedAgents = [];
+  agentNpubStrs.forEach(function (s) {
+    var h = npubToHex(s);
+    if (h && pairedAgents.indexOf(h) < 0) pairedAgents.push(h);
+  });
+  loggedIn = !!(myHumanHex && pairedAgents.length);
+  if (!loggedIn) { myName = 'guest'; myPicture = null; }
+  return loggedIn;
+}
+/* companion pairing: our heartbeat carries pair=[agent hex pubkeys] when
+   logged in and pairing is on. Each agent watches for its own key and stays
+   only while its human is here. Nothing is hard-coded. */
 var pairingOn = true;
 try { pairingOn = localStorage.getItem('aw_pair_mica') !== '0'; } catch (e) {}
-var pairedAgents = [];   // hex pubkeys, from Settings
-try {
-  var _sp = JSON.parse(localStorage.getItem('aw_pairs') || '[]');
-  if (Array.isArray(_sp)) pairedAgents = _sp.filter(function (x) { return /^[0-9a-f]{64}$/.test(x); });
-} catch (e) {}
+var pairedAgents = [];   // hex pubkeys, derived from the agent npub field(s)
+refreshLogin();
 
 /* bech32 (for npub -> hex) */
 function bech32Decode(str) {
@@ -162,6 +194,7 @@ function handleMsg(data) {
   else if (sub.purpose === 'obj') onObjEvent(ev);
   else if (sub.purpose === 'pres') onPresence(ev);
   else if (sub.purpose === 'chat') onChat(ev);
+  else if (sub.purpose === 'prof') onProfile(ev);
 }
 
 /* ---------------- three.js scene ---------------- */
@@ -368,13 +401,33 @@ function onPresence(ev) {
     var av = makeAvatar(p.name || 'guest');
     av.position.set(p.x, 0, p.z);
     peerGroup.add(av);
-    peer = { avatar: av, name: (p.name || 'guest').slice(0, 24), x: p.x, z: p.z, yaw: p.yaw || 0, lastSeen: Date.now() };
+    peer = { avatar: av, name: (p.name || 'guest').slice(0, 24), x: p.x, z: p.z, yaw: p.yaw || 0, lastSeen: Date.now(), picUrl: null, picSprite: null };
     peers.set(ev.pubkey, peer);
     sysLine(peer.name + ' entered');
   } else {
     peer.x = p.x; peer.z = p.z; peer.yaw = p.yaw || 0; peer.lastSeen = Date.now();
   }
+  setPeerPicture(peer, (p && typeof p.picture === 'string') ? p.picture : null);
   updateOnline();
+}
+/* profile picture above the avatar's head (from the human's kind-0 via presence) */
+var texLoader = null;
+function setPeerPicture(peer, url) {
+  if (!url || !/^https?:\/\//i.test(url)) url = null;
+  if (peer.picUrl === url) return;
+  peer.picUrl = url;
+  if (peer.picSprite) { peer.avatar.remove(peer.picSprite); peer.picSprite = null; }
+  if (!url) return;
+  try {
+    if (!texLoader) { texLoader = new THREE.TextureLoader(); texLoader.setCrossOrigin('anonymous'); }
+    texLoader.load(url, function (tex) {
+      var sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
+      sp.scale.set(0.55, 0.55, 1);
+      sp.position.y = 2.78;
+      peer.avatar.add(sp);
+      peer.picSprite = sp;
+    }, undefined, function () { peer.picUrl = 'bad'; });
+  } catch (e) { peer.picUrl = 'bad'; }
 }
 function makeAvatar(name) {
   var g = new THREE.Group();
@@ -402,8 +455,39 @@ function makeAvatar(name) {
 async function publishPresence() {
   if (!myPubHex) return;
   var body = { name: myName, x: +player.x.toFixed(2), y: 0, z: +player.z.toFixed(2), yaw: +yaw.toFixed(2) };
-  if (pairingOn && pairedAgents.length) body.pair = pairedAgents.slice();
+  if (myPicture) body.picture = myPicture;   // others render our kind-0 picture
+  if (loggedIn && pairingOn && pairedAgents.length) body.pair = pairedAgents.slice();
   publish(await makeEvent(20010, [['room', roomId]], JSON.stringify(body)));
+}
+/* ---- kind-0 profile: name + picture come from your npub ---- */
+function shortId(h) { return '@' + String(h || '').slice(0, 8); }
+function resolveProfile() {
+  if (!loggedIn || !myHumanHex) { myName = 'guest'; myPicture = null; return; }
+  myName = shortId(myHumanHex);   // placeholder until kind 0 arrives
+  myPicture = null;
+  var id = 'aw:prof:' + (subSeq++);
+  var filter = { kinds: [0], authors: [myHumanHex], limit: 1 };
+  activeSubs.push({ id: id, purpose: 'prof', room: roomId, filter: filter });
+  broadcast(JSON.stringify(['REQ', id, filter]));
+  setTimeout(function () { closeProfileSub(id); }, 12000);
+}
+function closeProfileSub(id) {
+  broadcast(JSON.stringify(['CLOSE', id]));
+  for (var i = 0; i < activeSubs.length; i++)
+    if (activeSubs[i].id === id) { activeSubs.splice(i, 1); break; }
+}
+function onProfile(ev) {
+  if (ev.kind !== 0 || ev.pubkey !== myHumanHex) return;
+  var p = null;
+  try { p = JSON.parse(ev.content); } catch (e) { return; }
+  var nm = String(p.display_name || p.name || '').trim().slice(0, 24);
+  myName = nm || shortId(myHumanHex);
+  var pic = (typeof p.picture === 'string' && /^https?:\/\//i.test(p.picture)) ? p.picture : null;
+  myPicture = pic;
+  for (var i = activeSubs.length - 1; i >= 0; i--)
+    if (activeSubs[i].purpose === 'prof') { closeProfileSub(activeSubs[i].id); }
+  publishPresence();   // heartbeat at once with our real name + picture
+  sysLine('logged in as ' + myName);
 }
 function togglePair() {
   pairingOn = !pairingOn;
@@ -416,28 +500,40 @@ function refreshPairBtn() {
   var b = $('pairbtn');
   if (!b) return;
   b.classList.toggle('off', !pairingOn);
-  b.title = !pairedAgents.length ? 'no agents paired — open settings (⚙️)' :
+  b.title = !loggedIn ? 'log in with your npub pair (⚙️)' :
     (pairingOn ? 'agents paired — tap to dismiss them' : 'pairing off — tap to call your agents');
 }
-/* ---------------- settings ---------------- */
+/* ---------------- settings: npub-pair login ---------------- */
 function openSettings() {
-  $('pairin').value = pairedAgents.join('\n');
-  $('pairmsg').textContent = '';
+  $('humannpub').value = humanNpubStr;
+  $('pairin').value = agentNpubStrs.join('\n');
+  $('loginmsg').textContent = '';
   $('settingspanel').classList.add('open');
 }
 function closeSettings() { $('settingspanel').classList.remove('open'); }
-function savePairs() {
-  var lines = $('pairin').value.split('\n');
-  var out = [], bad = 0;
+function saveLogin() {
+  humanNpubStr = $('humannpub').value.trim();
+  var lines = $('pairin').value.split('\n'), out = [], bad = 0;
   lines.forEach(function (ln) {
     ln = ln.trim(); if (!ln) return;
-    var h = npubToHex(ln);
-    if (h) { if (out.indexOf(h) < 0) out.push(h); } else bad++;
+    if (npubToHex(ln)) { if (out.indexOf(ln) < 0) out.push(ln); } else bad++;
   });
-  pairedAgents = out;
-  try { localStorage.setItem('aw_pairs', JSON.stringify(out)); } catch (e) {}
-  $('pairmsg').textContent = bad ? ('saved, ' + bad + ' line(s) ignored') :
-    (out.length ? 'saved — ' + out.length + ' agent(s) paired' : 'saved — no agents paired');
+  agentNpubStrs = out;
+  try {
+    localStorage.setItem('aw_human_npub', humanNpubStr);
+    localStorage.setItem('aw_agent_npubs', JSON.stringify(out));
+    localStorage.removeItem('aw_pairs');   // v0.4.x key, superseded
+    localStorage.removeItem('aw_name');    // v0.4.x key, superseded
+  } catch (e) {}
+  refreshLogin();
+  var msg;
+  if (loggedIn) { msg = 'logged in — resolving profile…'; resolveProfile(); }
+  else {
+    msg = 'guest mode — both npubs are required to log in';
+    myName = 'guest'; myPicture = null;
+  }
+  if (bad) msg += ' (' + bad + ' line(s) ignored)';
+  $('loginmsg').textContent = msg;
   refreshPairBtn();
   publishPresence();
 }
@@ -446,7 +542,7 @@ function bindSettings() {
     $('settingspanel').classList.contains('open') ? closeSettings() : openSettings();
   });
   $('setclose').addEventListener('click', closeSettings);
-  $('pairsave').addEventListener('click', savePairs);
+  $('pairsave').addEventListener('click', saveLogin);
 }
 function updateOnline() { $('online').textContent = (peers.size + 1) + ' online'; }
 
@@ -496,7 +592,7 @@ function bindHist() {
   if (pb) {
     refreshPairBtn();
     pb.addEventListener('click', function () {
-      if (!pairedAgents.length) openSettings(); else togglePair();
+      if (!loggedIn) openSettings(); else togglePair();
     });
   }
 }
@@ -574,13 +670,6 @@ function bindLook() {
 function bindChat() {
   $('sendbtn').addEventListener('click', sendChat);
   $('chatin').addEventListener('keydown', function (e) { if (e.key === 'Enter') sendChat(); });
-  $('namesave').addEventListener('click', function () {
-    var v = $('namein').value.trim().slice(0, 24) || 'guest';
-    myName = v;
-    try { localStorage.setItem('aw_name', v); } catch (e) {}
-    sysLine('name set to ' + v);
-    publishPresence();
-  });
 }
 function onTap(cx, cy) {
   var r = renderer.domElement.getBoundingClientRect();
@@ -707,18 +796,20 @@ async function init() {
   bindChat();
   bindHist();
   bindSettings();
-  $('namein').value = myName;
+  refreshLogin();
   $('roomname').textContent = 'room: ' + roomId;
   var seen = false;
   try { seen = !!localStorage.getItem('aw_seen'); } catch (e) {}
   if (seen) hideHint(); else setTimeout(hideHint, 10000);
   buildScene(fallbackVRML(roomId));   // instant local room; replaced when 30030 arrives
   sysLine('welcome to AgentWorld — waiting for the live room…');
+  if (!loggedIn) sysLine('guest mode: open ⚙️ and enter your npub + an agent npub to log in');
   try {
     await initIdentity();
   } catch (e) { sysLine('identity error: ' + e.message); return; }
   setSubs();
   connectRelays();
+  if (loggedIn) resolveProfile();   // fetch our kind-0 name + picture
   setInterval(publishPresence, 3000);
   animate();
 }
